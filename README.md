@@ -1,4 +1,4 @@
-# aws-monitor
+# aws-cost-report
 
 A small Rust CLI that shows the AWS bill for the current month, a range of recent
 complete months, or the last N months including the current one, for the account
@@ -31,7 +31,7 @@ visible account. It uses the official AWS SDK for Rust and the Cost Explorer
 - Forces the Cost Explorer region to `us-east-1`, where the global API lives.
 
 ```text
-$ aws-monitor -p management
+$ aws-cost-report -p management
 Organizational Cost  $6,831.55
 Period               October 2026 (month to date)
 
@@ -97,22 +97,22 @@ credentials only expose that member's own account.
 cargo build --release
 
 # Current month to date with the default billing profile
-./target/release/aws-monitor
+./target/release/aws-cost-report
 
 # Previous month
-./target/release/aws-monitor -1
+./target/release/aws-cost-report -1
 
 # Last 3 complete months before the current one
-./target/release/aws-monitor -3
+./target/release/aws-cost-report -3
 
 # Last 6 complete months before the current one
-./target/release/aws-monitor -6
+./target/release/aws-cost-report -6
 
 # Last 3 months including the current one
-./target/release/aws-monitor -m3
+./target/release/aws-cost-report -m3
 
 # Select a different profile
-./target/release/aws-monitor -p my-sso-profile -3
+./target/release/aws-cost-report -p my-sso-profile -3
 ```
 
 Or with Cargo:
@@ -144,7 +144,7 @@ cargo run --release -- -p billing-sso
 The app itself never invokes the AWS CLI. For an SSO profile, the SDK uses the
 cached SSO access token, so establish the session first with
 `aws sso login --profile <profile>` (or another SSO client), then run
-`aws-monitor`. If the session has expired, the SDK returns a credentials error;
+`aws-cost-report`. If the session has expired, the SDK returns a credentials error;
 re-run the login command.
 
 ## IAM permissions

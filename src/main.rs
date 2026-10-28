@@ -19,7 +19,7 @@ const DEFAULT_PROFILE: &str = "billing";
 
 /// Show AWS costs by account and service for the current or recent months.
 #[derive(Debug, Parser)]
-#[command(name = "aws-monitor", version, about)]
+#[command(name = "aws-cost-report", version, about)]
 #[command(group(
     ArgGroup::new("period")
         .args([
@@ -642,18 +642,18 @@ mod tests {
 
     #[test]
     fn parses_profile_flags() {
-        let cli = Cli::try_parse_from(["aws-monitor", "--profile", "billing-sso"])
+        let cli = Cli::try_parse_from(["aws-cost-report", "--profile", "billing-sso"])
             .expect("parse long flag");
         assert_eq!(cli.profile, "billing-sso");
 
-        let cli =
-            Cli::try_parse_from(["aws-monitor", "-p", "billing-sso"]).expect("parse short flag");
+        let cli = Cli::try_parse_from(["aws-cost-report", "-p", "billing-sso"])
+            .expect("parse short flag");
         assert_eq!(cli.profile, "billing-sso");
     }
 
     #[test]
     fn uses_billing_profile_and_current_month_by_default() {
-        let cli = Cli::try_parse_from(["aws-monitor"]).expect("parse defaults");
+        let cli = Cli::try_parse_from(["aws-cost-report"]).expect("parse defaults");
         assert_eq!(cli.profile, DEFAULT_PROFILE);
         assert!(matches!(
             cli.period_selection(),
@@ -664,7 +664,7 @@ mod tests {
     #[test]
     fn parses_period_flags() {
         for (flag, months) in [("-1", 1), ("-3", 3), ("-6", 6)] {
-            let cli = Cli::try_parse_from(["aws-monitor", flag]).expect("parse period flag");
+            let cli = Cli::try_parse_from(["aws-cost-report", flag]).expect("parse period flag");
             assert!(matches!(
                 cli.period_selection(),
                 PeriodSelection::CompleteMonthsBefore(value) if value == months
@@ -676,7 +676,7 @@ mod tests {
             ("--last-3-months", 3),
             ("--last-6-months", 6),
         ] {
-            let cli = Cli::try_parse_from(["aws-monitor", flag]).expect("parse period flag");
+            let cli = Cli::try_parse_from(["aws-cost-report", flag]).expect("parse period flag");
             assert!(matches!(
                 cli.period_selection(),
                 PeriodSelection::CompleteMonthsBefore(value) if value == months
@@ -687,9 +687,9 @@ mod tests {
     #[test]
     fn parses_months_including_the_current_month() {
         for (args, months) in [
-            (vec!["aws-monitor", "-m3"], 3),
-            (vec!["aws-monitor", "-m", "6"], 6),
-            (vec!["aws-monitor", "--months", "12"], 12),
+            (vec!["aws-cost-report", "-m3"], 3),
+            (vec!["aws-cost-report", "-m", "6"], 6),
+            (vec!["aws-cost-report", "--months", "12"], 12),
         ] {
             let cli = Cli::try_parse_from(args).expect("parse months flag");
             assert!(matches!(
@@ -701,21 +701,21 @@ mod tests {
 
     #[test]
     fn months_must_be_between_one_and_twelve() {
-        assert!(Cli::try_parse_from(["aws-monitor", "-m0"]).is_err());
-        assert!(Cli::try_parse_from(["aws-monitor", "-m13"]).is_err());
-        assert!(Cli::try_parse_from(["aws-monitor", "-mabc"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-m0"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-m13"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-mabc"]).is_err());
     }
 
     #[test]
     fn period_flags_are_mutually_exclusive() {
-        assert!(Cli::try_parse_from(["aws-monitor", "-1", "-3"]).is_err());
-        assert!(Cli::try_parse_from(["aws-monitor", "-3", "--last-6-months"]).is_err());
-        assert!(Cli::try_parse_from(["aws-monitor", "-m3", "-1"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-1", "-3"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-3", "--last-6-months"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-m3", "-1"]).is_err());
     }
 
     #[test]
     fn account_is_not_a_cli_argument() {
-        assert!(Cli::try_parse_from(["aws-monitor", "-a", "123456789012"]).is_err());
+        assert!(Cli::try_parse_from(["aws-cost-report", "-a", "123456789012"]).is_err());
     }
 
     #[test]
