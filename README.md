@@ -223,7 +223,7 @@ management account.
 - The app requests the `UnblendedCost` metric. This is usage cost before credits
   and refunds, so it can differ from the final invoice (which also includes
   taxes and other adjustments). To show net cost after credits/refunds, change
-  `METRIC` in `src/main.rs` to `NetUnblendedCost`.
+  `METRIC` in `src/lib.rs` to `NetUnblendedCost`.
 - Cost Explorer data is updated at least once every 24 hours, so the current
   day's charges may be incomplete.
 - The Cost Explorer API charges **$0.01 per request**. This app makes one
@@ -245,3 +245,14 @@ The test suite includes a mocked Cost Explorer HTTP endpoint, so it does not
 make AWS calls. The CLI uses [`clap`](https://docs.rs/clap) derive parsing, and
 the AWS calls use `aws-sdk-costexplorer`, `aws-sdk-organizations`, and
 `aws-config`.
+
+The code is split into a library crate and a thin binary:
+
+- `src/main.rs` — parses the command line and reports errors.
+- `src/lib.rs` — public `run` entry point and shared constants.
+- `src/cli.rs` — command-line arguments and period selection.
+- `src/billing.rs` — billing periods and the cost summary model.
+- `src/aws.rs` — Cost Explorer and Organizations API calls.
+- `src/report.rs` — formatted tables and CSV export.
+
+Library consumers can use `aws_cost_report::Cli` and `aws_cost_report::run`.
