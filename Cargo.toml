@@ -1,0 +1,27 @@
+[package]
+name = "aws-monitor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Show the current month-to-date AWS bill for an account"
+
+[dependencies]
+anyhow = "1.0.104"
+aws-config = { version = "1.13.0", default-features = false, features = [
+    "behavior-version-latest",
+    "credentials-process",
+    "legacy-client",
+    "rt-tokio",
+    "sso",
+] }
+aws-sdk-costexplorer = { version = "1.137.0", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+] }
+aws-sdk-organizations = { version = "1.136.0", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+] }
+chrono = { version = "0.4.45", features = ["clock"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
