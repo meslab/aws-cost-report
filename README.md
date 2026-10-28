@@ -29,6 +29,7 @@ visible account. It uses the official AWS SDK for Rust and the Cost Explorer
 - Omits accounts and services whose cost rounds to `$0.00`.
 - Handles Cost Explorer pagination and validates API amounts.
 - Forces the Cost Explorer region to `us-east-1`, where the global API lives.
+- Exports the service cost table to a CSV file with `--csv FILE`.
 
 ```text
 $ aws-cost-report -p management
@@ -113,6 +114,9 @@ cargo build --release
 
 # Select a different profile
 ./target/release/aws-cost-report -p my-sso-profile -3
+
+# Also export the service cost table to a CSV file
+./target/release/aws-cost-report -3 --csv costs.csv
 ```
 
 Or with Cargo:
@@ -127,6 +131,30 @@ is not included. `-m<NUMBER>` includes the current partial month, so `-m1` is
 the same as the default. For example, in October 2026, `-3` reports July through
 September 2026, while `-m3` reports August through October 2026. The `Period`
 line shows the selected range. Only one period option may be used at a time.
+
+## CSV export
+
+Pass `--csv FILE` (or `-c FILE`) to write the service cost table to a CSV file.
+The formatted tables are still printed, and a confirmation is written to stderr:
+
+```bash
+./target/release/aws-cost-report -3 --csv july-september-2026.csv
+```
+
+The file has one row per account and service, with the columns `period`,
+`account_name`, `account_id`, `service`, `cost`, and `unit`:
+
+```csv
+period,account_name,account_id,service,cost,unit
+July – September 2026,Production,111122223333,Amazon Elastic Compute Cloud - Compute,7500.00,USD
+July – September 2026,Production,111122223333,Amazon Simple Storage Service,606.54,USD
+July – September 2026,Shared,444455556666,Amazon Elastic Compute Cloud - Compute,4500.00,USD
+```
+
+Summing `cost` gives the organization total, and grouping by `account_id` gives
+the cost-by-account table. Account names that are unavailable are left blank.
+Fields containing commas, quotes, or line breaks are quoted per RFC 4180. If no
+costs are recorded, the file contains only the header row.
 
 ## Credentials
 

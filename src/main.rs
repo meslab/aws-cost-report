@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -41,6 +44,10 @@ struct Cli {
         default_value = DEFAULT_PROFILE
     )]
     profile: String,
+
+    /// Export the service cost table to a CSV file.
+    #[arg(short = 'c', long = "csv", value_name = "FILE")]
+    csv: Option<PathBuf>,
 
     /// Report the previous calendar month.
     #[arg(short = '1', long = "previous-month")]
@@ -106,6 +113,12 @@ async fn run(cli: Cli) -> Result<()> {
 
     let client = CostExplorerClient::new(&config);
     let summary = fetch_billing(&client, period, &account_names).await?;
+
+    if let Some(path) = &cli.csv {
+        write_csv(path, &summary)?;
+        eprintln!("wrote CSV export to {}", path.display());
+    }
+
     print_summary(&summary);
 
     Ok(())
@@ -370,7 +383,7 @@ fn print_summary(summary: &BillingSummary) {
     } else {
         print_breakdown_table(summary);
         println!();
-        println!("Cost by Account — {}", summary.period.label());
+        println!("Cost by Account: {}", summary.period.label());
         print_account_table(summary);
     }
 
@@ -499,6 +512,53 @@ fn print_account_table(summary: &BillingSummary) {
         cost_width = cost_width
     );
     println!("{}", table_rule('└', '┴', '┘', widths));
+}
+
+fn write_csv(path: &Path, summary: &BillingSummary) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("failed to create the CSV file {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    write_csv_to(&mut writer, summary)
+        .with_context(|| format!("failed to write the CSV file {}", path.display()))?;
+
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush the CSV file {}", path.display()))
+}
+
+fn write_csv_to(writer: &mut impl Write, summary: &BillingSummary) -> Result<()> {
+    writeln!(writer, "period,account_name,account_id,service,cost,unit")
+        .context("failed to write the CSV header")?;
+
+    let period = summary.period.label();
+    for account in &summary.accounts {
+        for service in &account.services {
+            writeln!(
+                writer,
+                "{},{},{},{},{:.2},{}",
+                csv_field(&period),
+                csv_field(account.name.as_deref().unwrap_or("")),
+                csv_field(&account.account_id),
+                csv_field(&service.name),
+                service.amount,
+                csv_field(&summary.unit),
+            )
+            .context("failed to write a CSV row")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Quote a CSV field when it contains a comma, quote, or line break. Embedded
+/// quotes are doubled, as required by RFC 4180.
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 fn account_name(account: &AccountCost) -> &str {
@@ -830,6 +890,92 @@ mod tests {
         assert_eq!(format_money(12.5, "EUR"), "€12.50");
         assert_eq!(format_money(12.5, "GBP"), "£12.50");
         assert_eq!(format_money(12.5, "JPY"), "12.50 JPY");
+    }
+
+    #[test]
+    fn csv_fields_are_escaped() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("with,comma"), "\"with,comma\"");
+        assert_eq!(csv_field("with \"quotes\""), "\"with \"\"quotes\"\"\"");
+        assert_eq!(csv_field("with\nnewline"), "\"with\nnewline\"");
+        assert_eq!(csv_field("with\r\nnewline"), "\"with\r\nnewline\"");
+    }
+
+    #[test]
+    fn csv_export_has_a_row_per_service() {
+        let summary = BillingSummary {
+            period: BillingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                end: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                month_to_date: true,
+            },
+            unit: "USD".to_owned(),
+            organization_total: 17.75,
+            accounts: vec![
+                AccountCost {
+                    account_id: "123456789012".to_owned(),
+                    name: Some("Production, Inc.".to_owned()),
+                    amount: 12.75,
+                    services: vec![
+                        ServiceCost {
+                            name: "Amazon \"EC2\"".to_owned(),
+                            amount: 10.5,
+                        },
+                        ServiceCost {
+                            name: "Amazon S3".to_owned(),
+                            amount: 2.25,
+                        },
+                    ],
+                },
+                AccountCost {
+                    account_id: "999999999999".to_owned(),
+                    name: None,
+                    amount: 5.0,
+                    services: vec![ServiceCost {
+                        name: "AWS Lambda".to_owned(),
+                        amount: 5.0,
+                    }],
+                },
+            ],
+            estimated: true,
+        };
+
+        let mut buffer = Vec::new();
+        write_csv_to(&mut buffer, &summary).expect("write CSV");
+
+        let csv = String::from_utf8(buffer).expect("CSV is UTF-8");
+        assert_eq!(
+            csv,
+            concat!(
+                "period,account_name,account_id,service,cost,unit\n",
+                "October 2026 (month to date),\"Production, Inc.\",123456789012,\"Amazon \"\"EC2\"\"\",10.50,USD\n",
+                "October 2026 (month to date),\"Production, Inc.\",123456789012,Amazon S3,2.25,USD\n",
+                "October 2026 (month to date),,999999999999,AWS Lambda,5.00,USD\n",
+            )
+        );
+    }
+
+    #[test]
+    fn csv_export_without_costs_writes_only_the_header() {
+        let summary = BillingSummary {
+            period: BillingPeriod {
+                start: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                end: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+                month_to_date: true,
+            },
+            unit: "USD".to_owned(),
+            organization_total: 0.0,
+            accounts: Vec::new(),
+            estimated: false,
+        };
+
+        let mut buffer = Vec::new();
+        write_csv_to(&mut buffer, &summary).expect("write CSV");
+
+        assert_eq!(
+            String::from_utf8(buffer).expect("CSV is UTF-8"),
+            "period,account_name,account_id,service,cost,unit\n"
+        );
     }
 
     #[tokio::test]
