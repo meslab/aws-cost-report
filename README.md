@@ -1,6 +1,7 @@
 # aws-monitor
 
-A small Rust CLI that shows the current month-to-date bill for the AWS account
+A small Rust CLI that shows the AWS bill for the current month, a range of recent
+complete months, or the last N months including the current one, for the account
 behind a named profile and, when visible, its AWS Organization. It prints the
 organization-wide total, a per-account breakdown, and service costs for every
 visible account. It uses the official AWS SDK for Rust and the Cost Explorer
@@ -10,14 +11,20 @@ visible account. It uses the official AWS SDK for Rust and the Cost Explorer
 
 - Accepts a named AWS profile with `-p` / `--profile`, including SSO profiles;
   defaults to `billing`.
-- Queries Cost Explorer for the current calendar month, grouped by
-  `LINKED_ACCOUNT` and `SERVICE`.
+- Reports the current month to date by default, the previous month with `-1`,
+  the previous 3 complete months with `-3`, or the previous 6 with `-6`. These
+  exclude the current month.
+- Reports the last N months including the current one with `-m<NUMBER>`, where
+  N is 1–12.
+- The period options are mutually exclusive.
+- Queries Cost Explorer for the selected period, grouped by `LINKED_ACCOUNT` and
+  `SERVICE`.
 - Looks up account names with AWS Organizations `ListAccounts` and shows each
   name next to its account number. If the lookup is unavailable, it falls back
   to account numbers only.
-- Prints the organization-wide total, a per-account cost table, and a service
-  cost table for every visible account, all sorted by cost. This mirrors the
-  management account's billing console instead of reporting only the payer
+- Prints the organization-wide total, a service breakdown for every visible
+  account, and a summary cost table by account, all sorted by cost. This mirrors
+  the management account's billing console instead of reporting only the payer
   account's own usage.
 - Omits accounts and services whose cost rounds to `$0.00`.
 - Handles Cost Explorer pagination and validates API amounts.
@@ -25,37 +32,53 @@ visible account. It uses the official AWS SDK for Rust and the Cost Explorer
 
 ```text
 $ aws-monitor -p management
-Organizational Cost $8,921.55
-Period              October 2026 (month to date)
+Organizational Cost  $6,831.55
+Period               October 2026 (month to date)
 
-Cost by Account
-ACCOUNT NAME  ACCOUNT            COST
-------------  ------------  ---------
-Production    111122223333  $3,402.18
-Shared        444455556666  $2,145.00
-Staging       123456789012  $1,284.37
-Analytics     777788889999  $1,090.37
-Sandbox       999900001111    $999.63
+┌───────────────────────────┬────────────────────────────────────────┬───────────┐
+│ ACCOUNT                   │ SERVICE                                │      COST │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│ Production (111122223333) │ Amazon Elastic Compute Cloud - Compute │ $2,500.00 │
+│                           │ Amazon Relational Database Service     │   $700.00 │
+│                           │ Amazon Simple Storage Service          │   $202.18 │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│                           │ ACCOUNT TOTAL                          │ $3,402.18 │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│ Shared (444455556666)     │ Amazon Elastic Compute Cloud - Compute │ $1,500.00 │
+│                           │ Amazon Elastic Block Store             │   $645.00 │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│                           │ ACCOUNT TOTAL                          │ $2,145.00 │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│ Staging (123456789012)    │ Amazon Elastic Compute Cloud - Compute │   $812.44 │
+│                           │ Amazon Relational Database Service     │   $221.10 │
+│                           │ Amazon Simple Storage Service          │    $96.83 │
+│                           │ Amazon CloudWatch                      │    $54.00 │
+│                           │ Amazon Elastic Container Service       │    $41.20 │
+│                           │ AWS Key Management Service             │    $22.40 │
+│                           │ Amazon Route 53                        │    $16.40 │
+│                           │ Amazon Virtual Private Cloud           │    $12.00 │
+│                           │ Amazon DynamoDB                        │     $8.00 │
+├───────────────────────────┼────────────────────────────────────────┼───────────┤
+│                           │ ACCOUNT TOTAL                          │ $1,284.37 │
+└───────────────────────────┴────────────────────────────────────────┴───────────┘
 
-Service Costs by Account
-Staging (123456789012)
-SERVICE                                      COST
--------------------------------------------  ---------
-Amazon Elastic Compute Cloud - Compute      $812.44
-Amazon Relational Database Service          $221.10
-Amazon Simple Storage Service               $96.83
-Amazon CloudWatch                           $54.00
-Amazon Elastic Container Service            $41.20
-AWS Key Management Service                  $22.40
-Amazon Route 53                             $16.40
-Amazon Virtual Private Cloud                $12.00
-Amazon DynamoDB                             $8.00
+Cost by Account — October 2026 (month to date)
+┌────────────┬──────────────┬───────────┐
+│ ACCOUNT    │ ACCOUNT ID   │      COST │
+├────────────┼──────────────┼───────────┤
+│ Production │ 111122223333 │ $3,402.18 │
+│ Shared     │ 444455556666 │ $2,145.00 │
+│ Staging    │ 123456789012 │ $1,284.37 │
+├────────────┼──────────────┼───────────┤
+│ TOTAL      │              │ $6,831.55 │
+└────────────┴──────────────┴───────────┘
 
 Source: AWS Cost Explorer (UnblendedCost, estimated). Data can lag by up to 24 hours.
 ```
 
-Each visible account gets its own service table. Zero-cost rows are omitted,
-and member credentials only expose that member's own account.
+Each account is grouped with its services and an account subtotal, followed by a
+summary table with every account's total. Zero-cost rows are omitted, and member
+credentials only expose that member's own account.
 
 ## Requirements
 
@@ -73,11 +96,23 @@ and member credentials only expose that member's own account.
 ```bash
 cargo build --release
 
-# Use the default billing profile
+# Current month to date with the default billing profile
 ./target/release/aws-monitor
 
+# Previous month
+./target/release/aws-monitor -1
+
+# Last 3 complete months before the current one
+./target/release/aws-monitor -3
+
+# Last 6 complete months before the current one
+./target/release/aws-monitor -6
+
+# Last 3 months including the current one
+./target/release/aws-monitor -m3
+
 # Select a different profile
-./target/release/aws-monitor -p my-sso-profile
+./target/release/aws-monitor -p my-sso-profile -3
 ```
 
 Or with Cargo:
@@ -86,6 +121,12 @@ Or with Cargo:
 cargo run --release --
 cargo run --release -- -p my-sso-profile
 ```
+
+`-1`, `-3`, and `-6` select complete calendar months; the current partial month
+is not included. `-m<NUMBER>` includes the current partial month, so `-m1` is
+the same as the default. For example, in October 2026, `-3` reports July through
+September 2026, while `-m3` reports August through October 2026. The `Period`
+line shows the selected range. Only one period option may be used at a time.
 
 ## Credentials
 

@@ -3,7 +3,7 @@ name = "aws-monitor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-description = "Show the current month-to-date AWS bill for an account"
+description = "Show AWS costs by account and service for the current or recent months"
 
 [dependencies]
 anyhow = "1.0.104"

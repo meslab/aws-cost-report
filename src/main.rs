@@ -9,7 +9,7 @@ use aws_sdk_costexplorer::types::{
 };
 use aws_sdk_organizations::Client as OrganizationsClient;
 use chrono::{Datelike, NaiveDate, Utc};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 /// Cost Explorer's API is hosted in us-east-1, regardless of where the
 /// account's resources live.
@@ -17,9 +17,19 @@ const COST_EXPLORER_REGION: &str = "us-east-1";
 const METRIC: &str = "UnblendedCost";
 const DEFAULT_PROFILE: &str = "billing";
 
-/// Show the current month-to-date AWS bill for an account.
+/// Show AWS costs by account and service for the current or recent months.
 #[derive(Debug, Parser)]
 #[command(name = "aws-monitor", version, about)]
+#[command(group(
+    ArgGroup::new("period")
+        .args([
+            "previous_month",
+            "last_three_months",
+            "last_six_months",
+            "months",
+        ])
+        .multiple(false)
+))]
 struct Cli {
     /// Named AWS profile to load credentials from, such as an SSO profile.
     ///
@@ -31,6 +41,43 @@ struct Cli {
         default_value = DEFAULT_PROFILE
     )]
     profile: String,
+
+    /// Report the previous calendar month.
+    #[arg(short = '1', long = "previous-month")]
+    previous_month: bool,
+
+    /// Report the last 3 months before the current one.
+    #[arg(short = '3', long = "last-3-months")]
+    last_three_months: bool,
+
+    /// Report the last 6 months before the current one.
+    #[arg(short = '6', long = "last-6-months")]
+    last_six_months: bool,
+
+    /// Report the last NUMBER months, including the current one.
+    #[arg(
+        short = 'm',
+        long = "months",
+        value_name = "NUMBER",
+        value_parser = parse_month_count
+    )]
+    months: Option<u32>,
+}
+
+impl Cli {
+    fn period_selection(&self) -> PeriodSelection {
+        if self.previous_month {
+            PeriodSelection::CompleteMonthsBefore(1)
+        } else if self.last_three_months {
+            PeriodSelection::CompleteMonthsBefore(3)
+        } else if self.last_six_months {
+            PeriodSelection::CompleteMonthsBefore(6)
+        } else if let Some(months) = self.months {
+            PeriodSelection::MonthsIncludingCurrent(months)
+        } else {
+            PeriodSelection::MonthToDate
+        }
+    }
 }
 
 #[tokio::main]
@@ -48,7 +95,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<()> {
     let config = load_config(&cli.profile).await;
-    let period = current_billing_period(Utc::now().date_naive());
+    let period = billing_period(Utc::now().date_naive(), cli.period_selection());
     let account_names = match fetch_account_names(&OrganizationsClient::new(&config)).await {
         Ok(names) => names,
         Err(error) => {
@@ -262,47 +309,69 @@ fn is_displayable_cost(amount: f64) -> bool {
     amount.abs() >= 0.005
 }
 
-fn current_billing_period(today: NaiveDate) -> BillingPeriod {
-    let start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+fn billing_period(today: NaiveDate, selection: PeriodSelection) -> BillingPeriod {
+    let current_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
         .expect("the first day of the current month is always valid");
 
-    let end = if today.month() == 12 {
-        NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-    } else {
-        NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
-    }
-    .expect("the first day of the next month is always valid");
+    match selection {
+        PeriodSelection::MonthToDate => BillingPeriod {
+            start: current_start,
+            end: add_months(current_start, 1),
+            month_to_date: true,
+        },
+        PeriodSelection::CompleteMonthsBefore(months) => BillingPeriod {
+            start: add_months(current_start, -(months as i32)),
+            end: current_start,
+            month_to_date: false,
+        },
+        PeriodSelection::MonthsIncludingCurrent(months) => {
+            assert!(months >= 1, "a period must include at least one month");
 
-    BillingPeriod { start, end }
+            BillingPeriod {
+                start: add_months(current_start, -((months - 1) as i32)),
+                end: add_months(current_start, 1),
+                month_to_date: true,
+            }
+        }
+    }
+}
+
+fn add_months(month_start: NaiveDate, months: i32) -> NaiveDate {
+    let total_months = month_start.year() * 12 + month_start.month0() as i32 + months;
+    let year = total_months.div_euclid(12);
+    let month = total_months.rem_euclid(12) as u32 + 1;
+
+    NaiveDate::from_ymd_opt(year, month, 1).expect("the first day of a month is always valid")
+}
+
+fn parse_month_count(value: &str) -> Result<u32, String> {
+    let months = value
+        .parse::<u32>()
+        .map_err(|_| "must be a whole number of months from 1 to 12".to_owned())?;
+
+    if (1..=12).contains(&months) {
+        Ok(months)
+    } else {
+        Err("must be from 1 to 12 months".to_owned())
+    }
 }
 
 fn print_summary(summary: &BillingSummary) {
     println!(
-        "{:<20}{}",
+        "{:<21}{}",
         "Organizational Cost",
         format_money(summary.organization_total, &summary.unit)
     );
-    println!(
-        "{:<20}{} (month to date)",
-        "Period",
-        summary.period.start.format("%B %Y")
-    );
+    println!("{:<21}{}", "Period", summary.period.label());
     println!();
 
-    if !summary.accounts.is_empty() {
-        println!("Cost by Account");
-        print_account_table(summary);
-    }
-
-    if !summary.accounts.is_empty() {
+    if summary.accounts.is_empty() {
+        println!("No costs have been recorded for the current billing period.");
+    } else {
+        print_breakdown_table(summary);
         println!();
-        println!("Service Costs by Account");
-        for (index, account) in summary.accounts.iter().enumerate() {
-            if index > 0 {
-                println!();
-            }
-            print_account_services(account, &summary.unit);
-        }
+        println!("Cost by Account — {}", summary.period.label());
+        print_account_table(summary);
     }
 
     println!();
@@ -315,101 +384,145 @@ fn print_summary(summary: &BillingSummary) {
     }
 }
 
-fn print_account_table(summary: &BillingSummary) {
-    let name_width = summary
-        .accounts
-        .iter()
-        .map(|account| account.name.as_deref().unwrap_or("-").chars().count())
-        .max()
-        .unwrap_or_default()
-        .max("ACCOUNT NAME".len());
+fn print_breakdown_table(summary: &BillingSummary) {
+    let mut account_width = "ACCOUNT".len();
+    let mut service_width = "SERVICE".len().max("ACCOUNT TOTAL".len());
+    let mut cost_width = "COST".len();
 
-    let account_width = summary
-        .accounts
-        .iter()
-        .map(|account| account.account_id.len())
-        .max()
-        .unwrap_or_default()
-        .max("ACCOUNT".len());
+    for account in &summary.accounts {
+        account_width = account_width.max(account_label(account).chars().count());
+        cost_width = cost_width.max(format_money(account.amount, &summary.unit).len());
 
-    let cost_width = summary
-        .accounts
-        .iter()
-        .map(|account| format_money(account.amount, &summary.unit).len())
-        .max()
-        .unwrap_or_default()
-        .max("COST".len());
+        for service in &account.services {
+            service_width = service_width.max(service.name.chars().count());
+            cost_width = cost_width.max(format_money(service.amount, &summary.unit).len());
+        }
+    }
 
+    let widths = [account_width, service_width, cost_width];
+    println!("{}", table_rule('┌', '┬', '┐', widths));
     println!(
-        "{:<name_width$}  {:<account_width$}  {:>cost_width$}",
-        "ACCOUNT NAME",
+        "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
         "ACCOUNT",
+        "SERVICE",
         "COST",
-        name_width = name_width,
         account_width = account_width,
+        service_width = service_width,
         cost_width = cost_width
     );
+    println!("{}", table_rule('├', '┼', '┤', widths));
+
+    for (account_index, account) in summary.accounts.iter().enumerate() {
+        for (service_index, service) in account.services.iter().enumerate() {
+            let label = if service_index == 0 {
+                account_label(account)
+            } else {
+                String::new()
+            };
+
+            println!(
+                "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
+                label,
+                service.name,
+                format_money(service.amount, &summary.unit),
+                account_width = account_width,
+                service_width = service_width,
+                cost_width = cost_width
+            );
+        }
+
+        println!("{}", table_rule('├', '┼', '┤', widths));
+        println!(
+            "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
+            "",
+            "ACCOUNT TOTAL",
+            format_money(account.amount, &summary.unit),
+            account_width = account_width,
+            service_width = service_width,
+            cost_width = cost_width
+        );
+
+        if account_index + 1 < summary.accounts.len() {
+            println!("{}", table_rule('├', '┼', '┤', widths));
+        }
+    }
+
+    println!("{}", table_rule('└', '┴', '┘', widths));
+}
+
+fn print_account_table(summary: &BillingSummary) {
+    let mut name_width = "ACCOUNT".len();
+    let mut id_width = "ACCOUNT ID".len();
+    let mut cost_width = "COST"
+        .len()
+        .max(format_money(summary.organization_total, &summary.unit).len());
+
+    for account in &summary.accounts {
+        name_width = name_width.max(account_name(account).chars().count());
+        id_width = id_width.max(account.account_id.chars().count());
+        cost_width = cost_width.max(format_money(account.amount, &summary.unit).len());
+    }
+
+    let widths = [name_width, id_width, cost_width];
+    println!("{}", table_rule('┌', '┬', '┐', widths));
     println!(
-        "{}  {}  {}",
-        "-".repeat(name_width),
-        "-".repeat(account_width),
-        "-".repeat(cost_width)
+        "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
+        "ACCOUNT",
+        "ACCOUNT ID",
+        "COST",
+        name_width = name_width,
+        id_width = id_width,
+        cost_width = cost_width
     );
+    println!("{}", table_rule('├', '┼', '┤', widths));
 
     for account in &summary.accounts {
         println!(
-            "{:<name_width$}  {:<account_width$}  {:>cost_width$}",
-            account.name.as_deref().unwrap_or("-"),
+            "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
+            account_name(account),
             account.account_id,
             format_money(account.amount, &summary.unit),
             name_width = name_width,
-            account_width = account_width,
+            id_width = id_width,
             cost_width = cost_width
         );
     }
-}
 
-fn print_account_services(account: &AccountCost, unit: &str) {
-    match &account.name {
-        Some(name) => println!("{name} ({})", account.account_id),
-        None => println!("{}", account.account_id),
-    }
-    print_service_table(&account.services, unit);
-}
-
-fn print_service_table(services: &[ServiceCost], unit: &str) {
-    let name_width = services
-        .iter()
-        .map(|service| service.name.chars().count())
-        .max()
-        .unwrap_or_default()
-        .max("SERVICE".len());
-
-    let cost_width = services
-        .iter()
-        .map(|service| format_money(service.amount, unit).len())
-        .max()
-        .unwrap_or_default()
-        .max("COST".len());
-
+    println!("{}", table_rule('├', '┼', '┤', widths));
     println!(
-        "{:<name_width$}  {:>cost_width$}",
-        "SERVICE",
-        "COST",
+        "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
+        "TOTAL",
+        "",
+        format_money(summary.organization_total, &summary.unit),
         name_width = name_width,
+        id_width = id_width,
         cost_width = cost_width
     );
-    println!("{}  {}", "-".repeat(name_width), "-".repeat(cost_width));
+    println!("{}", table_rule('└', '┴', '┘', widths));
+}
 
-    for service in services {
-        println!(
-            "{:<name_width$}  {:>cost_width$}",
-            service.name,
-            format_money(service.amount, unit),
-            name_width = name_width,
-            cost_width = cost_width
-        );
+fn account_name(account: &AccountCost) -> &str {
+    account
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("-")
+}
+
+fn account_label(account: &AccountCost) -> String {
+    match account.name.as_deref() {
+        Some(name) if !name.is_empty() => format!("{name} ({})", account.account_id),
+        _ => account.account_id.clone(),
     }
+}
+
+fn table_rule(left: char, middle: char, right: char, widths: [usize; 3]) -> String {
+    format!(
+        "{left}{}{middle}{}{middle}{}{right}",
+        "─".repeat(widths[0] + 2),
+        "─".repeat(widths[1] + 2),
+        "─".repeat(widths[2] + 2),
+    )
 }
 
 fn format_money(amount: f64, unit: &str) -> String {
@@ -444,10 +557,55 @@ fn format_number(amount: f64) -> String {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum PeriodSelection {
+    /// The current month up to today (the default).
+    MonthToDate,
+    /// That many complete calendar months before the current one.
+    CompleteMonthsBefore(u32),
+    /// That many months ending with the current one, which is partial.
+    MonthsIncludingCurrent(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
 struct BillingPeriod {
     start: NaiveDate,
     /// Exclusive, as required by the Cost Explorer API.
     end: NaiveDate,
+    /// Whether the period ends with the current, still-running month.
+    month_to_date: bool,
+}
+
+impl BillingPeriod {
+    fn label(&self) -> String {
+        let last_day = self
+            .end
+            .pred_opt()
+            .expect("a billing period always ends after it starts");
+        let suffix = if self.month_to_date {
+            " (month to date)"
+        } else {
+            ""
+        };
+        let same_month =
+            self.start.year() == last_day.year() && self.start.month() == last_day.month();
+
+        if same_month {
+            format!("{}{suffix}", self.start.format("%B %Y"))
+        } else if self.start.year() == last_day.year() {
+            format!(
+                "{} – {} {}{suffix}",
+                self.start.format("%B"),
+                last_day.format("%B"),
+                last_day.format("%Y")
+            )
+        } else {
+            format!(
+                "{} – {}{suffix}",
+                self.start.format("%B %Y"),
+                last_day.format("%B %Y")
+            )
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -494,9 +652,65 @@ mod tests {
     }
 
     #[test]
-    fn uses_billing_profile_by_default() {
+    fn uses_billing_profile_and_current_month_by_default() {
         let cli = Cli::try_parse_from(["aws-monitor"]).expect("parse defaults");
         assert_eq!(cli.profile, DEFAULT_PROFILE);
+        assert!(matches!(
+            cli.period_selection(),
+            PeriodSelection::MonthToDate
+        ));
+    }
+
+    #[test]
+    fn parses_period_flags() {
+        for (flag, months) in [("-1", 1), ("-3", 3), ("-6", 6)] {
+            let cli = Cli::try_parse_from(["aws-monitor", flag]).expect("parse period flag");
+            assert!(matches!(
+                cli.period_selection(),
+                PeriodSelection::CompleteMonthsBefore(value) if value == months
+            ));
+        }
+
+        for (flag, months) in [
+            ("--previous-month", 1),
+            ("--last-3-months", 3),
+            ("--last-6-months", 6),
+        ] {
+            let cli = Cli::try_parse_from(["aws-monitor", flag]).expect("parse period flag");
+            assert!(matches!(
+                cli.period_selection(),
+                PeriodSelection::CompleteMonthsBefore(value) if value == months
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_months_including_the_current_month() {
+        for (args, months) in [
+            (vec!["aws-monitor", "-m3"], 3),
+            (vec!["aws-monitor", "-m", "6"], 6),
+            (vec!["aws-monitor", "--months", "12"], 12),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse months flag");
+            assert!(matches!(
+                cli.period_selection(),
+                PeriodSelection::MonthsIncludingCurrent(value) if value == months
+            ));
+        }
+    }
+
+    #[test]
+    fn months_must_be_between_one_and_twelve() {
+        assert!(Cli::try_parse_from(["aws-monitor", "-m0"]).is_err());
+        assert!(Cli::try_parse_from(["aws-monitor", "-m13"]).is_err());
+        assert!(Cli::try_parse_from(["aws-monitor", "-mabc"]).is_err());
+    }
+
+    #[test]
+    fn period_flags_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["aws-monitor", "-1", "-3"]).is_err());
+        assert!(Cli::try_parse_from(["aws-monitor", "-3", "--last-6-months"]).is_err());
+        assert!(Cli::try_parse_from(["aws-monitor", "-m3", "-1"]).is_err());
     }
 
     #[test]
@@ -506,18 +720,100 @@ mod tests {
 
     #[test]
     fn billing_period_is_the_current_month() {
-        let period = current_billing_period(NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::MonthToDate,
+        );
 
         assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
         assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(period.label(), "October 2026 (month to date)");
     }
 
     #[test]
     fn billing_period_rolls_over_in_december() {
-        let period = current_billing_period(NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            PeriodSelection::MonthToDate,
+        );
 
         assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 12, 1).unwrap());
         assert_eq!(period.end, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
+    }
+
+    #[test]
+    fn previous_month_excludes_the_current_month() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::CompleteMonthsBefore(1),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(period.label(), "September 2026");
+    }
+
+    #[test]
+    fn last_three_months_exclude_the_current_month() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::CompleteMonthsBefore(3),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(period.label(), "July – September 2026");
+    }
+
+    #[test]
+    fn last_six_months_cross_the_year_boundary() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            PeriodSelection::CompleteMonthsBefore(6),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2025, 8, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 2, 1).unwrap());
+        assert_eq!(period.label(), "August 2025 – January 2026");
+    }
+
+    #[test]
+    fn months_including_current_include_the_current_month() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::MonthsIncludingCurrent(3),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(period.label(), "August – October 2026 (month to date)");
+    }
+
+    #[test]
+    fn one_month_including_current_matches_month_to_date() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::MonthsIncludingCurrent(1),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(period.label(), "October 2026 (month to date)");
+    }
+
+    #[test]
+    fn months_including_current_cross_the_year_boundary() {
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            PeriodSelection::MonthsIncludingCurrent(6),
+        );
+
+        assert_eq!(period.start, NaiveDate::from_ymd_opt(2025, 9, 1).unwrap());
+        assert_eq!(period.end, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        assert_eq!(
+            period.label(),
+            "September 2025 – February 2026 (month to date)"
+        );
     }
 
     #[test]
@@ -620,7 +916,10 @@ mod tests {
             .endpoint_url(format!("http://{address}"))
             .build();
         let client = CostExplorerClient::from_conf(config);
-        let period = current_billing_period(NaiveDate::from_ymd_opt(2026, 10, 28).unwrap());
+        let period = billing_period(
+            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
+            PeriodSelection::MonthToDate,
+        );
 
         let account_names = HashMap::from([
             ("123456789012".to_owned(), "Production".to_owned()),
