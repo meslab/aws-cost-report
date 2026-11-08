@@ -9,26 +9,39 @@ use aws_sdk_costexplorer::types::{
     DateInterval, Granularity, GroupDefinition, GroupDefinitionType,
 };
 use aws_sdk_organizations::Client as OrganizationsClient;
+use rust_decimal::Decimal;
 
-use crate::METRIC;
 use crate::billing::{
-    AccountCost, BillingPeriod, BillingSummary, ServiceCost, is_displayable_cost,
+    AccountCost, BillingPeriod, BillingSummary, Metric, ServiceCost, round_money,
 };
 
 /// Cost Explorer's API is hosted in us-east-1, regardless of where the
 /// account's resources live.
 const COST_EXPLORER_REGION: &str = "us-east-1";
 
+/// Raw costs grouped by linked account and service.
+#[derive(Debug)]
+pub(crate) struct CostData {
+    pub(crate) unit: Option<String>,
+    pub(crate) estimated: bool,
+    pub(crate) account_service_costs: HashMap<String, HashMap<String, Decimal>>,
+}
+
+/// Fetch every account name visible to the caller.
+///
+/// `ListAccounts` paginates with `NextToken`, so each request depends on the
+/// previous response and the pages must be fetched in order. The caller runs
+/// this lookup concurrently with [`fetch_costs`].
 pub(crate) async fn fetch_account_names(
     client: &OrganizationsClient,
 ) -> Result<HashMap<String, String>> {
     let mut names = HashMap::new();
-    let mut next_page_token: Option<String> = None;
+    let mut next_token: Option<String> = None;
 
     loop {
         let mut request = client.list_accounts();
 
-        if let Some(token) = next_page_token.take() {
+        if let Some(token) = next_token.take() {
             request = request.next_token(token);
         }
 
@@ -43,8 +56,8 @@ pub(crate) async fn fetch_account_names(
             }
         }
 
-        next_page_token = response.next_token().map(str::to_owned);
-        if next_page_token.is_none() {
+        next_token = response.next_token().map(str::to_owned);
+        if next_token.is_none() {
             break;
         }
     }
@@ -60,28 +73,32 @@ pub(crate) async fn load_config(profile: &str) -> SdkConfig {
         .await
 }
 
-pub(crate) async fn fetch_billing(
+pub(crate) async fn fetch_costs(
     client: &CostExplorerClient,
     period: BillingPeriod,
-    account_names: &HashMap<String, String>,
-) -> Result<BillingSummary> {
+    metric: Metric,
+) -> Result<CostData> {
+    let metric_name = metric.aws_name();
     let time_period = DateInterval::builder()
-        .start(period.start.format("%Y-%m-%d").to_string())
-        .end(period.end.format("%Y-%m-%d").to_string())
+        .start(period.start().format("%Y-%m-%d").to_string())
+        .end(period.end().format("%Y-%m-%d").to_string())
         .build()
         .context("failed to build the Cost Explorer time period")?;
 
-    let mut account_service_costs: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut account_service_costs: HashMap<String, HashMap<String, Decimal>> = HashMap::new();
     let mut unit: Option<String> = None;
     let mut estimated = false;
     let mut next_page_token: Option<String> = None;
 
+    // `GetCostAndUsage` returns the token for the next page only after the
+    // current page is fetched, so pagination is inherently sequential. The
+    // caller runs this query concurrently with the account-name lookup.
     loop {
         let mut request = client
             .get_cost_and_usage()
             .time_period(time_period.clone())
             .granularity(Granularity::Monthly)
-            .metrics(METRIC)
+            .metrics(metric_name)
             .group_by(
                 GroupDefinition::builder()
                     .r#type(GroupDefinitionType::Dimension)
@@ -122,9 +139,9 @@ pub(crate) async fn fetch_billing(
 
                 let metric = group
                     .metrics()
-                    .and_then(|metrics| metrics.get(METRIC))
+                    .and_then(|metrics| metrics.get(metric_name))
                     .ok_or_else(|| {
-                        anyhow!("Cost Explorer returned a group without a {METRIC} metric")
+                        anyhow!("Cost Explorer returned a group without a {metric_name} metric")
                     })?;
 
                 if let Some(group_unit) = metric.unit() {
@@ -141,12 +158,12 @@ pub(crate) async fn fetch_billing(
                 let amount = metric
                     .amount()
                     .ok_or_else(|| {
-                        anyhow!("Cost Explorer returned a {METRIC} metric without an amount")
+                        anyhow!("Cost Explorer returned a {metric_name} metric without an amount")
                     })?
-                    .parse::<f64>()
+                    .parse::<Decimal>()
                     .with_context(|| {
                         format!(
-                            "Cost Explorer returned an invalid {METRIC} amount for {service} \
+                            "Cost Explorer returned an invalid {metric_name} amount for {service} \
                              in account {linked_account}"
                         )
                     })?;
@@ -155,7 +172,7 @@ pub(crate) async fn fetch_billing(
                     .entry(linked_account.clone())
                     .or_default()
                     .entry(service)
-                    .or_insert(0.0) += amount;
+                    .or_insert(Decimal::ZERO) += amount;
             }
         }
 
@@ -165,31 +182,39 @@ pub(crate) async fn fetch_billing(
         }
     }
 
-    let organization_total = account_service_costs
-        .values()
-        .flat_map(|services| services.values())
-        .sum();
+    Ok(CostData {
+        unit,
+        estimated,
+        account_service_costs,
+    })
+}
 
-    let mut accounts: Vec<AccountCost> = account_service_costs
+pub(crate) fn assemble_summary(
+    period: BillingPeriod,
+    metric: Metric,
+    data: CostData,
+    account_names: &HashMap<String, String>,
+) -> BillingSummary {
+    let mut accounts: Vec<AccountCost> = data
+        .account_service_costs
         .into_iter()
         .filter_map(|(account_id, service_costs)| {
-            let amount: f64 = service_costs.values().sum();
-            if !is_displayable_cost(amount) {
+            let mut services: Vec<ServiceCost> = service_costs
+                .into_iter()
+                .filter_map(|(name, amount)| {
+                    let amount = round_money(amount);
+                    (!amount.is_zero()).then_some(ServiceCost { name, amount })
+                })
+                .collect();
+
+            if services.is_empty() {
                 return None;
             }
 
-            let name = account_names.get(&account_id).cloned();
-            let mut services: Vec<ServiceCost> = service_costs
-                .into_iter()
-                .filter(|(_, amount)| is_displayable_cost(*amount))
-                .map(|(name, amount)| ServiceCost { name, amount })
-                .collect();
-            services.sort_by(|a, b| {
-                b.amount
-                    .total_cmp(&a.amount)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
+            services.sort_by(|a, b| b.amount.cmp(&a.amount).then_with(|| a.name.cmp(&b.name)));
 
+            let amount = services.iter().map(|service| service.amount).sum();
+            let name = account_names.get(&account_id).cloned();
             Some(AccountCost {
                 account_id,
                 name,
@@ -198,104 +223,51 @@ pub(crate) async fn fetch_billing(
             })
         })
         .collect();
+
     accounts.sort_by(|a, b| {
         b.amount
-            .total_cmp(&a.amount)
+            .cmp(&a.amount)
             .then_with(|| a.account_id.cmp(&b.account_id))
     });
 
-    Ok(BillingSummary {
+    let organization_total = accounts.iter().map(|account| account.amount).sum();
+    let unit = data.unit.unwrap_or_else(|| "USD".to_owned());
+
+    BillingSummary {
         period,
-        unit: unit.unwrap_or_else(|| "USD".to_owned()),
+        metric,
+        unit,
         organization_total,
         accounts,
-        estimated,
-    })
+        estimated: data.estimated,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use chrono::NaiveDate;
 
     use super::*;
     use crate::billing::{PeriodSelection, billing_period};
 
-    #[tokio::test]
-    async fn fetches_and_aggregates_a_cost_explorer_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let address = listener.local_addr().expect("read mock server address");
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid test date")
+    }
 
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("set read timeout");
+    fn dec(value: &str) -> Decimal {
+        value.parse().expect("valid test decimal")
+    }
 
-            let request = read_http_request(&mut stream);
-            assert!(
-                request.contains("AWSInsightsIndexService.GetCostAndUsage"),
-                "unexpected request: {request}"
-            );
-            assert!(request.contains("LINKED_ACCOUNT"), "request: {request}");
-            assert!(request.contains("SERVICE"), "request: {request}");
-            assert!(!request.contains("\"Filter\""), "request: {request}");
-            assert!(request.contains("2026-10-01"), "request: {request}");
-            assert!(request.contains("2026-11-01"), "request: {request}");
+    fn period() -> BillingPeriod {
+        billing_period(date(2026, 10, 28), PeriodSelection::MonthToDate).expect("valid period")
+    }
 
-            let body = r#"{
-                "GroupDefinitions": [
-                    {"Key": "LINKED_ACCOUNT", "Type": "DIMENSION"},
-                    {"Key": "SERVICE", "Type": "DIMENSION"}
-                ],
-                "ResultsByTime": [{
-                    "Estimated": true,
-                    "Groups": [
-                        {
-                            "Keys": ["123456789012", "Amazon Elastic Compute Cloud - Compute"],
-                            "Metrics": {"UnblendedCost": {"Amount": "10.50", "Unit": "USD"}}
-                        },
-                        {
-                            "Keys": ["123456789012", "Amazon Simple Storage Service"],
-                            "Metrics": {"UnblendedCost": {"Amount": "2.25", "Unit": "USD"}}
-                        },
-                        {
-                            "Keys": ["999999999999", "Amazon Elastic Compute Cloud - Compute"],
-                            "Metrics": {"UnblendedCost": {"Amount": "5.00", "Unit": "USD"}}
-                        },
-                        {
-                            "Keys": ["123456789012", "AWS Lambda"],
-                            "Metrics": {"UnblendedCost": {"Amount": "0.00", "Unit": "USD"}}
-                        },
-                        {
-                            "Keys": ["777777777777", "Amazon Route 53"],
-                            "Metrics": {"UnblendedCost": {"Amount": "0.00", "Unit": "USD"}}
-                        }
-                    ],
-                    "TimePeriod": {"Start": "2026-10-01", "End": "2026-11-01"},
-                    "Total": {}
-                }]
-            }"#;
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/x-amz-json-1.1\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-            stream.flush().expect("flush response");
-        });
-
+    fn cost_explorer_client(address: SocketAddr) -> CostExplorerClient {
         let config = aws_sdk_costexplorer::Config::builder()
             .behavior_version_latest()
             .region(Region::new("us-east-1"))
@@ -308,51 +280,347 @@ mod tests {
             ))
             .endpoint_url(format!("http://{address}"))
             .build();
-        let client = CostExplorerClient::from_conf(config);
-        let period = billing_period(
-            NaiveDate::from_ymd_opt(2026, 10, 28).unwrap(),
-            PeriodSelection::MonthToDate,
-        );
+        CostExplorerClient::from_conf(config)
+    }
+
+    fn organizations_client(address: SocketAddr) -> OrganizationsClient {
+        let config = aws_sdk_organizations::Config::builder()
+            .behavior_version_latest()
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_organizations::config::Credentials::new(
+                "test-access-key",
+                "test-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(format!("http://{address}"))
+            .build();
+        OrganizationsClient::from_conf(config)
+    }
+
+    /// Serve one JSON response per connection and return the requests that were
+    /// received. Tests use one connection per page because every mock response
+    /// closes its connection.
+    fn serve_json(bodies: Vec<&'static str>) -> (SocketAddr, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("read mock server address");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking listener");
+
+        let server = thread::spawn(move || {
+            let total = bodies.len();
+            let mut requests = Vec::with_capacity(total);
+            let deadline = Instant::now() + Duration::from_secs(10);
+
+            for body in bodies {
+                // A bad fixture can leave the client with fewer pages to fetch
+                // than the server expects, so time out instead of hanging CI.
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(pair) => break pair,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "mock server timed out after {} of {total} requests",
+                                requests.len()
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept request: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).expect("set blocking stream");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("set read timeout");
+
+                requests.push(read_http_request(&mut stream));
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/x-amz-json-1.1\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+
+            requests
+        });
+
+        (address, server)
+    }
+
+    #[tokio::test]
+    async fn fetches_and_aggregates_a_cost_explorer_response() {
+        let body = r#"{
+            "GroupDefinitions": [
+                {"Key": "LINKED_ACCOUNT", "Type": "DIMENSION"},
+                {"Key": "SERVICE", "Type": "DIMENSION"}
+            ],
+            "ResultsByTime": [{
+                "Estimated": true,
+                "Groups": [
+                    {
+                        "Keys": ["123456789012", "Amazon Elastic Compute Cloud - Compute"],
+                        "Metrics": {"UnblendedCost": {"Amount": "10.50", "Unit": "USD"}}
+                    },
+                    {
+                        "Keys": ["123456789012", "Amazon Simple Storage Service"],
+                        "Metrics": {"UnblendedCost": {"Amount": "2.25", "Unit": "USD"}}
+                    },
+                    {
+                        "Keys": ["999999999999", "Amazon Elastic Compute Cloud - Compute"],
+                        "Metrics": {"UnblendedCost": {"Amount": "5.00", "Unit": "USD"}}
+                    },
+                    {
+                        "Keys": ["123456789012", "AWS Lambda"],
+                        "Metrics": {"UnblendedCost": {"Amount": "0.00", "Unit": "USD"}}
+                    },
+                    {
+                        "Keys": ["777777777777", "Amazon Route 53"],
+                        "Metrics": {"UnblendedCost": {"Amount": "0.00", "Unit": "USD"}}
+                    }
+                ],
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-11-01"},
+                "Total": {}
+            }]
+        }"#;
+        let (address, server) = serve_json(vec![body]);
+        let client = cost_explorer_client(address);
 
         let account_names = HashMap::from([
             ("123456789012".to_owned(), "Production".to_owned()),
             ("999999999999".to_owned(), "Sandbox".to_owned()),
         ]);
-        let summary = fetch_billing(&client, period, &account_names)
+        let data = fetch_costs(&client, period(), Metric::Unblended)
             .await
-            .expect("fetch billing summary");
+            .expect("fetch costs");
+        let summary = assemble_summary(period(), Metric::Unblended, data, &account_names);
 
-        server.join().expect("mock server thread panicked");
+        let requests = server.join().expect("mock server thread panicked");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(
+            request.contains("AWSInsightsIndexService.GetCostAndUsage"),
+            "unexpected request: {request}"
+        );
+        assert!(request.contains("LINKED_ACCOUNT"), "request: {request}");
+        assert!(request.contains("SERVICE"), "request: {request}");
+        assert!(request.contains("UnblendedCost"), "request: {request}");
+        assert!(!request.contains("\"Filter\""), "request: {request}");
+        assert!(request.contains("2026-10-01"), "request: {request}");
+        assert!(request.contains("2026-11-01"), "request: {request}");
 
         assert_eq!(summary.unit, "USD");
+        assert_eq!(summary.metric, Metric::Unblended);
         assert!(summary.estimated);
-        assert!((summary.organization_total - 17.75).abs() < f64::EPSILON);
+        assert_eq!(summary.organization_total, dec("17.75"));
 
         assert_eq!(summary.accounts.len(), 2);
         assert_eq!(summary.accounts[0].account_id, "123456789012");
         assert_eq!(summary.accounts[0].name.as_deref(), Some("Production"));
-        assert!((summary.accounts[0].amount - 12.75).abs() < f64::EPSILON);
+        assert_eq!(summary.accounts[0].amount, dec("12.75"));
         assert_eq!(summary.accounts[0].services.len(), 2);
         assert_eq!(
             summary.accounts[0].services[0].name,
             "Amazon Elastic Compute Cloud - Compute"
         );
-        assert!((summary.accounts[0].services[0].amount - 10.5).abs() < f64::EPSILON);
+        assert_eq!(summary.accounts[0].services[0].amount, dec("10.50"));
         assert_eq!(
             summary.accounts[0].services[1].name,
             "Amazon Simple Storage Service"
         );
-        assert!((summary.accounts[0].services[1].amount - 2.25).abs() < f64::EPSILON);
+        assert_eq!(summary.accounts[0].services[1].amount, dec("2.25"));
 
         assert_eq!(summary.accounts[1].account_id, "999999999999");
         assert_eq!(summary.accounts[1].name.as_deref(), Some("Sandbox"));
-        assert!((summary.accounts[1].amount - 5.0).abs() < f64::EPSILON);
+        assert_eq!(summary.accounts[1].amount, dec("5.00"));
         assert_eq!(summary.accounts[1].services.len(), 1);
-        assert_eq!(
-            summary.accounts[1].services[0].name,
-            "Amazon Elastic Compute Cloud - Compute"
+    }
+
+    #[tokio::test]
+    async fn follows_cost_explorer_pagination() {
+        let first_page = r#"{
+            "NextPageToken": "page-two",
+            "ResultsByTime": [{
+                "Estimated": false,
+                "Groups": [
+                    {
+                        "Keys": ["111111111111", "Amazon S3"],
+                        "Metrics": {"UnblendedCost": {"Amount": "1.00", "Unit": "USD"}}
+                    }
+                ],
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-11-01"},
+                "Total": {}
+            }]
+        }"#;
+        let second_page = r#"{
+            "ResultsByTime": [{
+                "Estimated": false,
+                "Groups": [
+                    {
+                        "Keys": ["111111111111", "Amazon S3"],
+                        "Metrics": {"UnblendedCost": {"Amount": "2.00", "Unit": "USD"}}
+                    }
+                ],
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-11-01"},
+                "Total": {}
+            }]
+        }"#;
+        let (address, server) = serve_json(vec![first_page, second_page]);
+        let client = cost_explorer_client(address);
+
+        let data = fetch_costs(&client, period(), Metric::Unblended)
+            .await
+            .expect("fetch paginated costs");
+        let summary = assemble_summary(period(), Metric::Unblended, data, &HashMap::new());
+
+        let requests = server.join().expect("mock server thread panicked");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].contains("page-two"),
+            "second request: {}",
+            requests[1]
         );
-        assert!((summary.accounts[1].services[0].amount - 5.0).abs() < f64::EPSILON);
+        assert_eq!(summary.organization_total, dec("3.00"));
+        assert_eq!(summary.accounts[0].services[0].amount, dec("3.00"));
+    }
+
+    #[tokio::test]
+    async fn rejects_mixed_units() {
+        let body = r#"{
+            "ResultsByTime": [{
+                "Estimated": false,
+                "Groups": [
+                    {
+                        "Keys": ["111111111111", "Amazon S3"],
+                        "Metrics": {"UnblendedCost": {"Amount": "1.00", "Unit": "USD"}}
+                    },
+                    {
+                        "Keys": ["111111111111", "Amazon EC2"],
+                        "Metrics": {"UnblendedCost": {"Amount": "1.00", "Unit": "EUR"}}
+                    }
+                ],
+                "TimePeriod": {"Start": "2026-10-01", "End": "2026-11-01"},
+                "Total": {}
+            }]
+        }"#;
+        let (address, server) = serve_json(vec![body]);
+        let client = cost_explorer_client(address);
+
+        let error = fetch_costs(&client, period(), Metric::Unblended)
+            .await
+            .expect_err("mixed units should fail");
+        server.join().expect("mock server thread panicked");
+
+        assert!(
+            format!("{error:#}").contains("mixed units"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn follows_organizations_pagination() {
+        // Organizations uses `NextToken`; only Cost Explorer uses `NextPageToken`.
+        let first_page = r#"{
+            "Accounts": [{"Id": "111111111111", "Name": "Production", "Status": "ACTIVE"}],
+            "NextToken": "next-accounts"
+        }"#;
+        let second_page = r#"{
+            "Accounts": [{"Id": "222222222222", "Name": "Sandbox", "Status": "ACTIVE"}]
+        }"#;
+        let (address, server) = serve_json(vec![first_page, second_page]);
+        let client = organizations_client(address);
+
+        let names = fetch_account_names(&client)
+            .await
+            .expect("fetch account names");
+
+        let requests = server.join().expect("mock server thread panicked");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("ListAccounts"),
+            "first request: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("next-accounts"),
+            "second request: {}",
+            requests[1]
+        );
+        assert_eq!(
+            names.get("111111111111").map(String::as_str),
+            Some("Production")
+        );
+        assert_eq!(
+            names.get("222222222222").map(String::as_str),
+            Some("Sandbox")
+        );
+    }
+
+    #[test]
+    fn sub_cent_services_are_filtered_and_totals_match_displayed_rows() {
+        let data = CostData {
+            unit: Some("USD".to_owned()),
+            estimated: false,
+            account_service_costs: HashMap::from([
+                (
+                    "111111111111".to_owned(),
+                    HashMap::from([
+                        ("Tiny A".to_owned(), dec("0.004")),
+                        ("Tiny B".to_owned(), dec("0.004")),
+                    ]),
+                ),
+                (
+                    "222222222222".to_owned(),
+                    HashMap::from([("Visible".to_owned(), dec("0.006"))]),
+                ),
+            ]),
+        };
+
+        let summary = assemble_summary(period(), Metric::NetUnblended, data, &HashMap::new());
+        let displayed_total: Decimal = summary
+            .accounts
+            .iter()
+            .flat_map(|account| account.services.iter())
+            .map(|service| service.amount)
+            .sum();
+
+        assert_eq!(summary.accounts.len(), 1);
+        assert_eq!(summary.accounts[0].account_id, "222222222222");
+        assert_eq!(summary.accounts[0].amount, dec("0.01"));
+        assert_eq!(summary.organization_total, dec("0.01"));
+        assert_eq!(displayed_total, summary.organization_total);
+    }
+
+    #[test]
+    fn account_totals_are_the_sum_of_their_services() {
+        let data = CostData {
+            unit: Some("USD".to_owned()),
+            estimated: true,
+            account_service_costs: HashMap::from([(
+                "111111111111".to_owned(),
+                HashMap::from([
+                    ("Amazon EC2".to_owned(), dec("10.00")),
+                    ("AWS Lambda".to_owned(), dec("-2.50")),
+                ]),
+            )]),
+        };
+
+        let summary = assemble_summary(period(), Metric::Unblended, data, &HashMap::new());
+
+        assert_eq!(summary.accounts[0].amount, dec("7.50"));
+        assert_eq!(summary.organization_total, dec("7.50"));
+        assert_eq!(summary.accounts[0].services.len(), 2);
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {

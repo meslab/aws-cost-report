@@ -1,69 +1,87 @@
 //! Human-readable report tables and CSV export.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use unicode_width::UnicodeWidthStr;
 
-use crate::METRIC;
-use crate::billing::{AccountCost, BillingSummary};
+use crate::billing::{AccountCost, BillingSummary, round_money};
 
-pub fn print_summary(summary: &BillingSummary) {
-    println!(
+/// Write the formatted report tables.
+pub fn render_summary(writer: &mut impl Write, summary: &BillingSummary) -> io::Result<()> {
+    writeln!(
+        writer,
         "{:<21}{}",
         "Organizational Cost",
         format_money(summary.organization_total, &summary.unit)
-    );
-    println!("{:<21}{}", "Period", summary.period.label());
-    println!();
+    )?;
+    writeln!(writer, "{:<21}{}", "Period", summary.period.label())?;
+    writeln!(writer)?;
 
     if summary.accounts.is_empty() {
-        println!("No costs have been recorded for the current billing period.");
+        writeln!(
+            writer,
+            "No costs have been recorded for {}.",
+            summary.period.label()
+        )?;
     } else {
-        print_breakdown_table(summary);
-        println!();
-        println!("Cost by Account: {}", summary.period.label());
-        print_account_table(summary);
+        render_breakdown_table(writer, summary)?;
+        writeln!(writer)?;
+        writeln!(writer, "Cost by Account — {}", summary.period.label())?;
+        render_account_table(writer, summary)?;
     }
 
-    println!();
+    writeln!(writer)?;
     if summary.estimated {
-        println!(
-            "Source: AWS Cost Explorer ({METRIC}, estimated). Data can lag by up to 24 hours."
-        );
+        writeln!(
+            writer,
+            "Source: AWS Cost Explorer ({}, estimated). Data can lag by up to 24 hours.",
+            summary.metric.aws_name()
+        )?;
     } else {
-        println!("Source: AWS Cost Explorer ({METRIC}). Data can lag by up to 24 hours.");
+        writeln!(
+            writer,
+            "Source: AWS Cost Explorer ({}). Data can lag by up to 24 hours.",
+            summary.metric.aws_name()
+        )?;
     }
+
+    Ok(())
 }
 
-fn print_breakdown_table(summary: &BillingSummary) {
-    let mut account_width = "ACCOUNT".len();
-    let mut service_width = "SERVICE".len().max("ACCOUNT TOTAL".len());
-    let mut cost_width = "COST".len();
+fn render_breakdown_table(writer: &mut impl Write, summary: &BillingSummary) -> io::Result<()> {
+    let mut account_width = "ACCOUNT".width();
+    let mut service_width = "SERVICE".width().max("ACCOUNT TOTAL".width());
+    let mut cost_width = "COST".width();
 
     for account in &summary.accounts {
-        account_width = account_width.max(account_label(account).chars().count());
-        cost_width = cost_width.max(format_money(account.amount, &summary.unit).len());
+        account_width = account_width.max(account_label(account).width());
+        cost_width = cost_width.max(format_money(account.amount, &summary.unit).width());
 
         for service in &account.services {
-            service_width = service_width.max(service.name.chars().count());
-            cost_width = cost_width.max(format_money(service.amount, &summary.unit).len());
+            service_width = service_width.max(service.name.width());
+            cost_width = cost_width.max(format_money(service.amount, &summary.unit).width());
         }
     }
 
     let widths = [account_width, service_width, cost_width];
-    println!("{}", table_rule('┌', '┬', '┐', widths));
-    println!(
-        "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
-        "ACCOUNT",
-        "SERVICE",
-        "COST",
-        account_width = account_width,
-        service_width = service_width,
-        cost_width = cost_width
-    );
-    println!("{}", table_rule('├', '┼', '┤', widths));
+    writeln!(writer, "{}", table_rule('┌', '┬', '┐', widths))?;
+    writeln!(
+        writer,
+        "{}",
+        padded_row(
+            "ACCOUNT",
+            account_width,
+            "SERVICE",
+            service_width,
+            "COST",
+            cost_width
+        )
+    )?;
+    writeln!(writer, "{}", table_rule('├', '┼', '┤', widths))?;
 
     for (account_index, account) in summary.accounts.iter().enumerate() {
         for (service_index, service) in account.services.iter().enumerate() {
@@ -73,131 +91,189 @@ fn print_breakdown_table(summary: &BillingSummary) {
                 String::new()
             };
 
-            println!(
-                "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
-                label,
-                service.name,
-                format_money(service.amount, &summary.unit),
-                account_width = account_width,
-                service_width = service_width,
-                cost_width = cost_width
-            );
+            writeln!(
+                writer,
+                "{}",
+                padded_row(
+                    &label,
+                    account_width,
+                    &service.name,
+                    service_width,
+                    &format_money(service.amount, &summary.unit),
+                    cost_width,
+                )
+            )?;
         }
 
-        println!("{}", table_rule('├', '┼', '┤', widths));
-        println!(
-            "│ {:<account_width$} │ {:<service_width$} │ {:>cost_width$} │",
-            "",
-            "ACCOUNT TOTAL",
-            format_money(account.amount, &summary.unit),
-            account_width = account_width,
-            service_width = service_width,
-            cost_width = cost_width
-        );
+        writeln!(writer, "{}", table_rule('├', '┼', '┤', widths))?;
+        writeln!(
+            writer,
+            "{}",
+            padded_row(
+                "",
+                account_width,
+                "ACCOUNT TOTAL",
+                service_width,
+                &format_money(account.amount, &summary.unit),
+                cost_width,
+            )
+        )?;
 
         if account_index + 1 < summary.accounts.len() {
-            println!("{}", table_rule('├', '┼', '┤', widths));
+            writeln!(writer, "{}", table_rule('├', '┼', '┤', widths))?;
         }
     }
 
-    println!("{}", table_rule('└', '┴', '┘', widths));
+    writeln!(writer, "{}", table_rule('└', '┴', '┘', widths))
 }
 
-fn print_account_table(summary: &BillingSummary) {
-    let mut name_width = "ACCOUNT".len();
-    let mut id_width = "ACCOUNT ID".len();
+fn render_account_table(writer: &mut impl Write, summary: &BillingSummary) -> io::Result<()> {
+    let mut name_width = "ACCOUNT".width();
+    let mut id_width = "ACCOUNT ID".width();
     let mut cost_width = "COST"
-        .len()
-        .max(format_money(summary.organization_total, &summary.unit).len());
+        .width()
+        .max(format_money(summary.organization_total, &summary.unit).width());
 
     for account in &summary.accounts {
-        name_width = name_width.max(account_name(account).chars().count());
-        id_width = id_width.max(account.account_id.chars().count());
-        cost_width = cost_width.max(format_money(account.amount, &summary.unit).len());
+        name_width = name_width.max(account_name(account).width());
+        id_width = id_width.max(account.account_id.width());
+        cost_width = cost_width.max(format_money(account.amount, &summary.unit).width());
     }
 
     let widths = [name_width, id_width, cost_width];
-    println!("{}", table_rule('┌', '┬', '┐', widths));
-    println!(
-        "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
-        "ACCOUNT",
-        "ACCOUNT ID",
-        "COST",
-        name_width = name_width,
-        id_width = id_width,
-        cost_width = cost_width
-    );
-    println!("{}", table_rule('├', '┼', '┤', widths));
+    writeln!(writer, "{}", table_rule('┌', '┬', '┐', widths))?;
+    writeln!(
+        writer,
+        "{}",
+        padded_row(
+            "ACCOUNT",
+            name_width,
+            "ACCOUNT ID",
+            id_width,
+            "COST",
+            cost_width
+        )
+    )?;
+    writeln!(writer, "{}", table_rule('├', '┼', '┤', widths))?;
 
     for account in &summary.accounts {
-        println!(
-            "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
-            account_name(account),
-            account.account_id,
-            format_money(account.amount, &summary.unit),
-            name_width = name_width,
-            id_width = id_width,
-            cost_width = cost_width
-        );
+        writeln!(
+            writer,
+            "{}",
+            padded_row(
+                account_name(account),
+                name_width,
+                &account.account_id,
+                id_width,
+                &format_money(account.amount, &summary.unit),
+                cost_width,
+            )
+        )?;
     }
 
-    println!("{}", table_rule('├', '┼', '┤', widths));
-    println!(
-        "│ {:<name_width$} │ {:<id_width$} │ {:>cost_width$} │",
-        "TOTAL",
-        "",
-        format_money(summary.organization_total, &summary.unit),
-        name_width = name_width,
-        id_width = id_width,
-        cost_width = cost_width
-    );
-    println!("{}", table_rule('└', '┴', '┘', widths));
+    writeln!(writer, "{}", table_rule('├', '┼', '┤', widths))?;
+    writeln!(
+        writer,
+        "{}",
+        padded_row(
+            "TOTAL",
+            name_width,
+            "",
+            id_width,
+            &format_money(summary.organization_total, &summary.unit),
+            cost_width,
+        )
+    )?;
+    writeln!(writer, "{}", table_rule('└', '┴', '┘', widths))
 }
 
-pub fn write_csv(path: &Path, summary: &BillingSummary) -> Result<()> {
-    let file = File::create(path)
-        .with_context(|| format!("failed to create the CSV file {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-
-    write_csv_to(&mut writer, summary)
-        .with_context(|| format!("failed to write the CSV file {}", path.display()))?;
-
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush the CSV file {}", path.display()))
-}
-
-fn write_csv_to(writer: &mut impl Write, summary: &BillingSummary) -> Result<()> {
-    writeln!(writer, "period,account_name,account_id,service,cost,unit")
-        .context("failed to write the CSV header")?;
+/// Write the service cost table as RFC 4180 CSV.
+pub fn write_csv(writer: &mut impl Write, summary: &BillingSummary) -> io::Result<()> {
+    write!(
+        writer,
+        "period,period_start,period_end,account_name,account_id,service,cost,unit\r\n"
+    )?;
 
     let period = summary.period.label();
+    let period_start = summary.period.start().format("%Y-%m-%d").to_string();
+    let period_end = summary.period.end().format("%Y-%m-%d").to_string();
     for account in &summary.accounts {
         for service in &account.services {
-            writeln!(
+            write!(
                 writer,
-                "{},{},{},{},{:.2},{}",
+                "{},{},{},{},{},{},{:.2},{}\r\n",
                 csv_field(&period),
+                period_start,
+                period_end,
                 csv_field(account.name.as_deref().unwrap_or("")),
                 csv_field(&account.account_id),
                 csv_field(&service.name),
                 service.amount,
                 csv_field(&summary.unit),
-            )
-            .context("failed to write a CSV row")?;
+            )?;
         }
     }
 
     Ok(())
 }
 
+/// Write a CSV export to `path`, creating or truncating the file with owner-only
+/// permissions on Unix.
+pub fn write_csv_file(path: &Path, summary: &BillingSummary) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to create the CSV file {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to restrict permissions on the CSV file {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    file.set_len(0)
+        .with_context(|| format!("failed to truncate the CSV file {}", path.display()))?;
+
+    let mut writer = BufWriter::new(file);
+    write_csv(&mut writer, summary)
+        .with_context(|| format!("failed to write the CSV file {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush the CSV file {}", path.display()))
+}
+
 /// Quote a CSV field when it contains a comma, quote, or line break. Embedded
-/// quotes are doubled, as required by RFC 4180.
+/// quotes are doubled, as required by RFC 4180. Fields that a spreadsheet could
+/// interpret as formulas are prefixed with an apostrophe.
 fn csv_field(value: &str) -> String {
+    let mut value = value.to_owned();
+
+    if value
+        .chars()
+        .next()
+        .is_some_and(|first| matches!(first, '=' | '+' | '-' | '@' | '\t' | '\r'))
+    {
+        value.insert(0, '\'');
+    }
+
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
-        value.to_owned()
+        value
     }
 }
 
@@ -225,20 +301,52 @@ fn table_rule(left: char, middle: char, right: char, widths: [usize; 3]) -> Stri
     )
 }
 
-fn format_money(amount: f64, unit: &str) -> String {
-    let number = format_number(amount);
+fn padded_row(
+    left: &str,
+    left_width: usize,
+    middle: &str,
+    middle_width: usize,
+    right: &str,
+    right_width: usize,
+) -> String {
+    format!(
+        "│ {} │ {} │ {} │",
+        pad_right(left, left_width),
+        pad_right(middle, middle_width),
+        pad_left(right, right_width)
+    )
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(value.width());
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn pad_left(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(value.width());
+    format!("{}{value}", " ".repeat(padding))
+}
+
+fn format_money(amount: Decimal, unit: &str) -> String {
+    let formatted = format_number(amount);
+    let (sign, number) = formatted
+        .strip_prefix('-')
+        .map_or(("", formatted.as_str()), |rest| ("-", rest));
 
     match unit {
-        "USD" => format!("${number}"),
-        "EUR" => format!("€{number}"),
-        "GBP" => format!("£{number}"),
-        other => format!("{number} {other}"),
+        "USD" => format!("{sign}${number}"),
+        "EUR" => format!("{sign}€{number}"),
+        "GBP" => format!("{sign}£{number}"),
+        other => format!("{sign}{number} {other}"),
     }
 }
 
-fn format_number(amount: f64) -> String {
-    let negative = amount < 0.0;
-    let fixed = format!("{:.2}", amount.abs());
+fn format_number(amount: Decimal) -> String {
+    // Round before choosing the sign so amounts below half a cent do not render
+    // as `-$0.00`.
+    let rounded = round_money(amount);
+    let negative = rounded.is_sign_negative() && !rounded.is_zero();
+    let fixed = format!("{:.2}", rounded.abs());
     let (whole, fraction) = fixed.split_once('.').unwrap_or((fixed.as_str(), "00"));
 
     let mut grouped = String::with_capacity(fixed.len() + whole.len() / 3);
@@ -259,24 +367,58 @@ fn format_number(amount: f64) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
+    use tempfile::tempdir;
 
     use super::*;
-    use crate::billing::{BillingPeriod, ServiceCost};
+    use crate::billing::{BillingPeriod, Metric, ServiceCost};
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid test date")
+    }
+
+    fn dec(value: &str) -> Decimal {
+        value.parse().expect("valid test decimal")
+    }
+
+    fn test_period() -> BillingPeriod {
+        BillingPeriod::new(date(2026, 10, 1), date(2026, 11, 1), true).expect("valid period")
+    }
+
+    fn summary(accounts: Vec<AccountCost>) -> BillingSummary {
+        let organization_total = accounts.iter().map(|account| account.amount).sum();
+        BillingSummary {
+            period: test_period(),
+            metric: Metric::Unblended,
+            unit: "USD".to_owned(),
+            organization_total,
+            accounts,
+            estimated: true,
+        }
+    }
 
     #[test]
     fn numbers_are_grouped_and_rounded() {
-        assert_eq!(format_number(1_234_567.891), "1,234,567.89");
-        assert_eq!(format_number(42.0), "42.00");
-        assert_eq!(format_number(-1_234.5), "-1,234.50");
-        assert_eq!(format_number(0.0), "0.00");
+        assert_eq!(format_number(dec("1234567.891")), "1,234,567.89");
+        assert_eq!(format_number(dec("42")), "42.00");
+        assert_eq!(format_number(dec("-1234.5")), "-1,234.50");
+        assert_eq!(format_number(Decimal::ZERO), "0.00");
     }
 
     #[test]
     fn money_uses_the_metric_unit() {
-        assert_eq!(format_money(12.5, "USD"), "$12.50");
-        assert_eq!(format_money(12.5, "EUR"), "€12.50");
-        assert_eq!(format_money(12.5, "GBP"), "£12.50");
-        assert_eq!(format_money(12.5, "JPY"), "12.50 JPY");
+        assert_eq!(format_money(dec("12.5"), "USD"), "$12.50");
+        assert_eq!(format_money(dec("12.5"), "EUR"), "€12.50");
+        assert_eq!(format_money(dec("12.5"), "GBP"), "£12.50");
+        assert_eq!(format_money(dec("12.5"), "JPY"), "12.50 JPY");
+    }
+
+    #[test]
+    fn negative_money_puts_the_sign_before_the_symbol() {
+        assert_eq!(format_money(dec("-12.5"), "USD"), "-$12.50");
+        assert_eq!(format_money(dec("-12.5"), "EUR"), "-€12.50");
+        assert_eq!(format_money(dec("-12.5"), "GBP"), "-£12.50");
+        assert_eq!(format_money(dec("-12.5"), "JPY"), "-12.50 JPY");
+        assert_eq!(format_money(dec("-0.001"), "USD"), "$0.00");
     }
 
     #[test]
@@ -289,79 +431,155 @@ mod tests {
     }
 
     #[test]
+    fn csv_fields_cannot_start_a_spreadsheet_formula() {
+        assert_eq!(csv_field("=SUM(A1)"), "'=SUM(A1)");
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("-1"), "'-1");
+        assert_eq!(csv_field("@cmd"), "'@cmd");
+        assert_eq!(csv_field("=1,2"), "\"'=1,2\"");
+    }
+
+    #[test]
     fn csv_export_has_a_row_per_service() {
-        let summary = BillingSummary {
-            period: BillingPeriod {
-                start: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
-                end: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
-                month_to_date: true,
+        let summary = summary(vec![
+            AccountCost {
+                account_id: "123456789012".to_owned(),
+                name: Some("Production, Inc.".to_owned()),
+                amount: dec("12.75"),
+                services: vec![
+                    ServiceCost {
+                        name: "Amazon \"EC2\"".to_owned(),
+                        amount: dec("10.50"),
+                    },
+                    ServiceCost {
+                        name: "Amazon S3".to_owned(),
+                        amount: dec("2.25"),
+                    },
+                ],
             },
-            unit: "USD".to_owned(),
-            organization_total: 17.75,
-            accounts: vec![
-                AccountCost {
-                    account_id: "123456789012".to_owned(),
-                    name: Some("Production, Inc.".to_owned()),
-                    amount: 12.75,
-                    services: vec![
-                        ServiceCost {
-                            name: "Amazon \"EC2\"".to_owned(),
-                            amount: 10.5,
-                        },
-                        ServiceCost {
-                            name: "Amazon S3".to_owned(),
-                            amount: 2.25,
-                        },
-                    ],
-                },
-                AccountCost {
-                    account_id: "999999999999".to_owned(),
-                    name: None,
-                    amount: 5.0,
-                    services: vec![ServiceCost {
-                        name: "AWS Lambda".to_owned(),
-                        amount: 5.0,
-                    }],
-                },
-            ],
-            estimated: true,
-        };
+            AccountCost {
+                account_id: "999999999999".to_owned(),
+                name: None,
+                amount: dec("5.00"),
+                services: vec![ServiceCost {
+                    name: "AWS Lambda".to_owned(),
+                    amount: dec("5.00"),
+                }],
+            },
+        ]);
 
         let mut buffer = Vec::new();
-        write_csv_to(&mut buffer, &summary).expect("write CSV");
+        write_csv(&mut buffer, &summary).expect("write CSV");
 
         let csv = String::from_utf8(buffer).expect("CSV is UTF-8");
         assert_eq!(
             csv,
             concat!(
-                "period,account_name,account_id,service,cost,unit\n",
-                "October 2026 (month to date),\"Production, Inc.\",123456789012,\"Amazon \"\"EC2\"\"\",10.50,USD\n",
-                "October 2026 (month to date),\"Production, Inc.\",123456789012,Amazon S3,2.25,USD\n",
-                "October 2026 (month to date),,999999999999,AWS Lambda,5.00,USD\n",
+                "period,period_start,period_end,account_name,account_id,service,cost,unit\r\n",
+                "October 2026 (month to date),2026-10-01,2026-11-01,\"Production, Inc.\",123456789012,\"Amazon \"\"EC2\"\"\",10.50,USD\r\n",
+                "October 2026 (month to date),2026-10-01,2026-11-01,\"Production, Inc.\",123456789012,Amazon S3,2.25,USD\r\n",
+                "October 2026 (month to date),2026-10-01,2026-11-01,,999999999999,AWS Lambda,5.00,USD\r\n",
             )
         );
     }
 
     #[test]
     fn csv_export_without_costs_writes_only_the_header() {
-        let summary = BillingSummary {
-            period: BillingPeriod {
-                start: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
-                end: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
-                month_to_date: true,
-            },
-            unit: "USD".to_owned(),
-            organization_total: 0.0,
-            accounts: Vec::new(),
-            estimated: false,
-        };
+        let summary = summary(Vec::new());
 
         let mut buffer = Vec::new();
-        write_csv_to(&mut buffer, &summary).expect("write CSV");
+        write_csv(&mut buffer, &summary).expect("write CSV");
 
         assert_eq!(
             String::from_utf8(buffer).expect("CSV is UTF-8"),
-            "period,account_name,account_id,service,cost,unit\n"
+            "period,period_start,period_end,account_name,account_id,service,cost,unit\r\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn csv_file_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("costs.csv");
+
+        write_csv_file(&path, &summary(Vec::new())).expect("write CSV file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("read CSV metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn csv_file_tightens_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("create temporary directory");
+        let path = directory.path().join("costs.csv");
+        std::fs::write(&path, "old").expect("write old CSV");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set old permissions");
+
+        write_csv_file(&path, &summary(Vec::new())).expect("overwrite CSV file");
+
+        let mode = std::fs::metadata(&path)
+            .expect("read CSV metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read CSV"),
+            "period,period_start,period_end,account_name,account_id,service,cost,unit\r\n"
+        );
+    }
+
+    #[test]
+    fn renders_tables_with_negative_money() {
+        let summary = summary(vec![AccountCost {
+            account_id: "123456789012".to_owned(),
+            name: Some("Production".to_owned()),
+            amount: dec("-12.50"),
+            services: vec![ServiceCost {
+                name: "AWS Credits".to_owned(),
+                amount: dec("-12.50"),
+            }],
+        }]);
+
+        let mut buffer = Vec::new();
+        render_summary(&mut buffer, &summary).expect("render summary");
+        let output = String::from_utf8(buffer).expect("table is UTF-8");
+
+        assert!(output.contains("Organizational Cost  -$12.50"));
+        assert!(output.contains("Production (123456789012)"));
+        assert!(output.contains("ACCOUNT TOTAL"));
+        assert!(output.contains("Cost by Account — October 2026 (month to date)"));
+        assert!(output.contains("Source: AWS Cost Explorer (UnblendedCost, estimated)"));
+    }
+
+    #[test]
+    fn empty_report_names_the_selected_period() {
+        let mut summary = summary(Vec::new());
+        summary.period =
+            BillingPeriod::new(date(2026, 9, 1), date(2026, 10, 1), false).expect("valid period");
+
+        let mut buffer = Vec::new();
+        render_summary(&mut buffer, &summary).expect("render summary");
+        let output = String::from_utf8(buffer).expect("table is UTF-8");
+
+        assert!(output.contains("No costs have been recorded for September 2026."));
+    }
+
+    #[test]
+    fn unicode_width_padding_aligns_wide_characters() {
+        assert_eq!(pad_right("日本", 6), "日本  ");
+        assert_eq!(pad_right("abc", 6), "abc   ");
+        assert_eq!(pad_left("$1.00", 8), "   $1.00");
+        assert_eq!(pad_left("€1.00", 8), "   €1.00");
     }
 }
