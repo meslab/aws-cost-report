@@ -2,12 +2,17 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDate;
 use clap::{ArgGroup, Parser};
 
-use crate::billing::PeriodSelection;
+use crate::ReportRequest;
+use crate::billing::{BillingPeriodError, Metric, PeriodSelection, billing_period};
 
 /// The default SSO profile used when `--profile` is omitted.
 pub const DEFAULT_PROFILE: &str = "billing";
+
+/// The flag value that writes CSV output to standard output.
+pub const STDOUT_PATH: &str = "-";
 
 /// Show AWS costs by account and service for the current or recent months.
 #[derive(Debug, Parser)]
@@ -34,9 +39,27 @@ pub struct Cli {
     )]
     profile: String,
 
-    /// Export the service cost table to a CSV file.
+    /// Export the service cost table to a CSV file, or to stdout with "-".
     #[arg(short = 'c', long = "csv", value_name = "FILE")]
     csv: Option<PathBuf>,
+
+    /// Cost metric to report: `unblended` (before credits) or
+    /// `net-unblended` (after credits).
+    #[arg(
+        long = "metric",
+        value_name = "METRIC",
+        default_value = "unblended",
+        value_parser = parse_metric
+    )]
+    metric: Metric,
+
+    /// Suppress the formatted tables and status messages.
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+
+    /// Skip the AWS Organizations lookup and show account numbers only.
+    #[arg(long = "no-account-names")]
+    no_account_names: bool,
 
     /// Report the previous calendar month.
     #[arg(short = '1', long = "previous-month")]
@@ -66,9 +89,30 @@ impl Cli {
         &self.profile
     }
 
-    /// The optional path for the CSV export.
+    /// The optional path for the CSV export. [`STDOUT_PATH`] means stdout.
     pub fn csv(&self) -> Option<&Path> {
         self.csv.as_deref()
+    }
+
+    /// Whether CSV output should be written to standard output.
+    pub fn csv_to_stdout(&self) -> bool {
+        self.csv()
+            .is_some_and(|path| path == Path::new(STDOUT_PATH))
+    }
+
+    /// The Cost Explorer metric to report.
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Whether formatted tables and status messages should be suppressed.
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
+    /// Whether the AWS Organizations account-name lookup should be skipped.
+    pub fn no_account_names(&self) -> bool {
+        self.no_account_names
     }
 
     /// The period selected by the period flags.
@@ -85,6 +129,20 @@ impl Cli {
             PeriodSelection::MonthToDate
         }
     }
+
+    /// Build a CLI-independent report request for `today`.
+    pub fn report_request(&self, today: NaiveDate) -> Result<ReportRequest, BillingPeriodError> {
+        Ok(ReportRequest {
+            profile: self.profile.clone(),
+            period: billing_period(today, self.period_selection())?,
+            metric: self.metric,
+            include_account_names: !self.no_account_names,
+        })
+    }
+}
+
+fn parse_metric(value: &str) -> Result<Metric, String> {
+    value.parse()
 }
 
 fn parse_month_count(value: &str) -> Result<u32, String> {
@@ -101,7 +159,13 @@ fn parse_month_count(value: &str) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::*;
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("valid test date")
+    }
 
     #[test]
     fn parses_profile_flags() {
@@ -118,10 +182,38 @@ mod tests {
     fn uses_billing_profile_and_current_month_by_default() {
         let cli = Cli::try_parse_from(["aws-cost-report"]).expect("parse defaults");
         assert_eq!(cli.profile, DEFAULT_PROFILE);
+        assert_eq!(cli.metric(), Metric::Unblended);
+        assert!(!cli.quiet());
+        assert!(!cli.no_account_names());
         assert!(matches!(
             cli.period_selection(),
             PeriodSelection::MonthToDate
         ));
+    }
+
+    #[test]
+    fn parses_metric_flags() {
+        let cli = Cli::try_parse_from(["aws-cost-report", "--metric", "net-unblended"])
+            .expect("parse metric");
+        assert_eq!(cli.metric(), Metric::NetUnblended);
+
+        assert!(Cli::try_parse_from(["aws-cost-report", "--metric", "gross"]).is_err());
+    }
+
+    #[test]
+    fn parses_script_friendly_flags() {
+        let cli = Cli::try_parse_from([
+            "aws-cost-report",
+            "--quiet",
+            "--no-account-names",
+            "--csv",
+            "-",
+        ])
+        .expect("parse script flags");
+
+        assert!(cli.quiet());
+        assert!(cli.no_account_names());
+        assert!(cli.csv_to_stdout());
     }
 
     #[test]
@@ -179,5 +271,26 @@ mod tests {
     #[test]
     fn account_is_not_a_cli_argument() {
         assert!(Cli::try_parse_from(["aws-cost-report", "-a", "123456789012"]).is_err());
+    }
+
+    #[test]
+    fn builds_a_report_request() {
+        let cli = Cli::try_parse_from([
+            "aws-cost-report",
+            "--metric",
+            "net-unblended",
+            "--no-account-names",
+            "-1",
+        ])
+        .expect("parse report flags");
+        let request = cli
+            .report_request(date(2026, 10, 28))
+            .expect("valid report request");
+
+        assert_eq!(request.profile, DEFAULT_PROFILE);
+        assert_eq!(request.period.start(), date(2026, 9, 1));
+        assert_eq!(request.period.end(), date(2026, 10, 1));
+        assert_eq!(request.metric, Metric::NetUnblended);
+        assert!(!request.include_account_names);
     }
 }
