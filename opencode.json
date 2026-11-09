@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "servers": {
+      "rust-mcp-server": {
+        "type": "local",
+        "command": [
+          "rust-mcp-server"
+        ]
+      }
+    }
+  }
+}

@@ -19,3 +19,10 @@
 
 ## Constraints
 - Git commit messages must not exceed 72 characters
+- Never edit `Cargo.lock` use `cargo update` command to update its content
+
+## Key Dependencies
+- aws-config: 1.13.0 (with features: behavior-version-latest, credentials-process, legacy-client, rt-tokio, sso)
+- aws-sdk-costexplorer: 1.138.0 (with features: rt-tokio, rustls)
+- aws-sdk-organizations: 1.137.0 (with features: rt-tokio, rustls)
+- clap: 4.6.7 (with features: derive)
