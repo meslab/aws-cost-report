@@ -29,3 +29,4 @@ Rust CLI that reports AWS costs by account and service via Cost Explorer.
 ## Constraints
 - Commit messages must not exceed 72 characters (Conventional Commits).
 - Never hand-edit `Cargo.lock`; use `cargo update` to change it.
+- Ignore git commit hook modifications; do not try to fix them.
